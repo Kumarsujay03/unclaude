@@ -58,6 +58,19 @@ unclaude prevent                  # stop Claude Code adding attribution in futur
 
 `TARGET` can be `OWNER/REPO`, an `https://github.com/...` URL, a `git@github.com:...` URL, or any other git URL/path (the cache flush is GitHub-only and is skipped for non-GitHub targets).
 
+### Several repos at once
+
+```bash
+unclaude you/app you/api you/site            # clean several repos in one run
+unclaude --all --dry-run                     # scan every repo you own (no forks, no archived)
+unclaude --all                               # clean every repo you own that needs it
+unclaude you/app you/api --refresh-clean     # also flush the graph of repos that are already clean
+```
+
+All repos are scanned first, then you get one plan and one `yes` prompt. A repo that fails (no access, branch protection, …) is reported and the rest carry on; a summary at the end lists what happened to each, and the exit code is non-zero if any failed.
+
+With a single repo, an already-clean history still gets the graph flush (useful after cleaning it some other way). With several repos, clean ones are skipped so `--all` doesn't add an empty commit to every repo you own; pass `--refresh-clean` to flush them too.
+
 Example:
 
 ```
