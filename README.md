@@ -118,3 +118,11 @@ Inspired by [declaude](https://github.com/ediiloupatty/declaude), rewritten from
 ## License
 
 [MIT](LICENSE)
+
+## Uninstall
+
+```bash
+rm ~/.local/bin/unclaude
+```
+
+Backups in `~/.unclaude-backups/` are left in place; delete them when you no longer need them.
