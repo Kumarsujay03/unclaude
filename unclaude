@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# unclaude: strip Claude attribution from a repo's history and refresh GitHub's contributors graph.
+set -euo pipefail
+
+BACKUP_DIR="$HOME/.unclaude-backups"
+# Lines that make GitHub count Claude as a contributor (kept in sync with CALLBACK below).
+GREP_PATTERN='^[[:space:]]*(co-authored-by:.*(claude|anthropic)|.*generated with \[?claude code)'
+CALLBACK='
+import re
+new = re.sub(rb"(?im)^[ \t]*(co-authored-by:[^\n]*(claude|anthropic)[^\n]*|[^\n]*generated with \[?claude code[^\n]*)(\n|$)", b"", message)
+if new != message:
+    new = re.sub(rb"\n{3,}", b"\n\n", new).rstrip() + b"\n"
+return new
+'
+
+usage() {
+  cat <<EOF
+usage: unclaude TARGET [--dry-run] [-y] [--no-refresh] [--no-backup]
+       unclaude prevent
+
+TARGET      OWNER/REPO, a GitHub URL, or any git URL/path (graph refresh is GitHub-only)
+--dry-run   report what would change, touch nothing
+-y          don't ask for confirmation
+--no-refresh  skip the branch rename + empty commit that flush GitHub's graph cache
+--no-backup   skip the restore bundle in $BACKUP_DIR
+prevent     turn off Claude Code attribution in ~/.claude/settings.json
+EOF
+}
+
+say()  { printf '  %s\n' "$*"; }
+die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
+
+prevent() {
+  python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path.home() / ".claude" / "settings.json"
+p.parent.mkdir(exist_ok=True)
+s = json.loads(p.read_text()) if p.exists() and p.read_text().strip() else {}
+s["attribution"] = {"commit": "", "pr": ""}
+s["includeCoAuthoredBy"] = False
+p.write_text(json.dumps(s, indent=2) + "\n")
+print(f"  attribution disabled in {p}")
+PY
+}
+
+count_traces() {  # commits whose message carries a Claude line
+  git -C "$1" log --all --regexp-ignore-case --extended-regexp --grep="$GREP_PATTERN" --format=%H | wc -l
+}
+
+count_authored() {  # commits where Claude is author/committer (not rewritten, only reported)
+  git -C "$1" log --all --format='%an %ae %cn %ce' | grep -ciE 'claude|anthropic' || true
+}
+
+refresh_graph() {
+  local slug=$1 repo=$2 def tmp tip new graph
+  def=$(gh api "repos/$slug" --jq .default_branch)
+  tmp="$def-unclaude-tmp"
+
+  say "flushing contributor cache (rename $def → $tmp → $def)…"
+  gh api -X POST "repos/$slug/branches/$def/rename" -f new_name="$tmp" >/dev/null
+  sleep 3
+  gh api -X POST "repos/$slug/branches/$tmp/rename" -f new_name="$def" >/dev/null
+
+  say "pushing empty refresh commit to $def…"
+  git -C "$repo" fetch -q origin "$def"
+  tip=$(git -C "$repo" rev-parse FETCH_HEAD)
+  new=$(git -C "$repo" commit-tree "$tip^{tree}" -p "$tip" -m "chore: refresh GitHub contributors")
+  git -C "$repo" push -q origin "$new:refs/heads/$def"
+
+  say "waiting for GitHub to rebuild the graph…"
+  for _ in $(seq 1 20); do
+    graph=$(gh api "repos/$slug/stats/contributors" --jq '[.[].author.login] | join(", ")' 2>/dev/null || true)
+    [ -n "$graph" ] && break
+    sleep 5
+  done
+  if [ -z "$graph" ]; then
+    say "graph still computing; recheck Insights → Contributors in a few minutes."
+  elif grep -qi claude <<<"$graph"; then
+    say "graph still lists: $graph (cache lag; recheck later in a private window)"
+  else
+    say "contributors now: $graph"
+  fi
+}
+
+main() {
+  [ $# -eq 0 ] && { usage; exit 1; }
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    prevent)   prevent; exit 0 ;;
+  esac
+
+  local target=$1; shift
+  local dry=0 yes=0 refresh=1 backup=1
+  for a in "$@"; do
+    case $a in
+      --dry-run) dry=1 ;;
+      -y|--yes) yes=1 ;;
+      --no-refresh) refresh=0 ;;
+      --no-backup) backup=0 ;;
+      *) usage; die "unknown option: $a" ;;
+    esac
+  done
+
+  command -v git-filter-repo >/dev/null || die "git-filter-repo not found (pipx install git-filter-repo)"
+
+  local slug="" url
+  if [[ $target =~ ^(https://github\.com/|git@github\.com:)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$ ]]; then
+    slug=${BASH_REMATCH[2]%.git}
+    command -v gh >/dev/null || die "gh (GitHub CLI) not found"
+    if [ "$(gh config get git_protocol 2>/dev/null)" = ssh ]; then
+      url="git@github.com:$slug.git"
+    else
+      url="https://github.com/$slug.git"
+    fi
+  else
+    url=$target
+    refresh=0
+  fi
+
+  local repo
+  WORK=$(mktemp -d)
+  trap 'rm -rf "$WORK"' EXIT
+  repo="$WORK/repo.git"
+
+  say "cloning ${slug:-$url}…"
+  git clone -q --bare "$url" "$repo"
+
+  local traces authored
+  traces=$(count_traces "$repo")
+  authored=$(count_authored "$repo")
+  echo
+  say "repo     : ${slug:-$url}"
+  say "traces   : $traces commit(s) with a Claude co-author/generated line"
+  [ "$authored" -gt 0 ] && say "warning  : $authored commit(s) have Claude as author/committer; left as is (use git filter-repo --mailmap)"
+  if [ "$traces" -eq 0 ]; then
+    say "history already clean"
+    [ $refresh -eq 0 ] && exit 0
+    say "plan     : refresh GitHub's contributors graph only"
+  else
+    say "plan     : rewrite history, force-push branches + tags$([ $refresh -eq 1 ] && echo ', refresh graph')"
+  fi
+  echo
+
+  [ $dry -eq 1 ] && { say "dry run, nothing changed."; exit 0; }
+  if [ $yes -eq 0 ]; then
+    read -r -p "  Continue? type 'yes': " ok
+    [ "$ok" = yes ] || die "aborted"
+  fi
+
+  if [ "$traces" -gt 0 ]; then
+    if [ $backup -eq 1 ]; then
+      mkdir -p "$BACKUP_DIR"
+      local bundle="$BACKUP_DIR/$(basename "${slug:-$url}" .git)-$(date +%Y%m%d-%H%M%S).bundle"
+      git -C "$repo" bundle create -q "$bundle" --all
+      say "backup   : $bundle"
+    fi
+
+    say "rewriting history…"
+    local out
+    out=$(git -C "$repo" filter-repo --force --quiet --message-callback "$CALLBACK" 2>&1) || die "filter-repo failed: $out"
+    local left
+    left=$(count_traces "$repo")
+    [ "$left" -eq 0 ] || die "$left commit(s) still carry Claude lines; nothing pushed"
+
+    say "force-pushing branches and tags…"
+    git -C "$repo" remote add origin "$url"   # filter-repo drops origin
+    git -C "$repo" push -q --force origin 'refs/heads/*:refs/heads/*'
+    git -C "$repo" push -q --force origin 'refs/tags/*:refs/tags/*'
+  else
+    git -C "$repo" remote get-url origin >/dev/null 2>&1 || git -C "$repo" remote add origin "$url"
+  fi
+
+  [ $refresh -eq 1 ] && refresh_graph "$slug" "$repo"
+  echo
+  say "done."
+}
+
+main "$@"
