@@ -15,15 +15,20 @@ return new
 
 usage() {
   cat <<EOF
-usage: unclaude TARGET [--dry-run] [-y] [--no-refresh] [--no-backup]
+usage: unclaude TARGET... [--dry-run] [-y] [--no-refresh] [--no-backup] [--refresh-clean]
+       unclaude --all [OPTIONS]
        unclaude prevent
 
-TARGET      OWNER/REPO, a GitHub URL, or any git URL/path (graph refresh is GitHub-only)
---dry-run   report what would change, touch nothing
--y          don't ask for confirmation
---no-refresh  skip the branch rename + empty commit that flush GitHub's graph cache
---no-backup   skip the restore bundle in $BACKUP_DIR
-prevent     turn off Claude Code attribution in ~/.claude/settings.json
+TARGET          OWNER/REPO, a GitHub URL, or any git URL/path (graph refresh is GitHub-only);
+                give several to clean them in one run
+--all           every non-fork, non-archived repo owned by the logged-in gh user
+--dry-run       report what would change, touch nothing
+-y              don't ask for confirmation
+--no-refresh    skip the branch rename + empty commit that flush GitHub's graph cache
+--no-backup     skip the restore bundles in $BACKUP_DIR
+--refresh-clean also flush the graph of repos whose history is already clean
+                (the default when a single repo is given)
+prevent         turn off Claude Code attribution in ~/.claude/settings.json
 EOF
 }
 
@@ -82,78 +87,22 @@ refresh_graph() {
   fi
 }
 
-main() {
-  [ $# -eq 0 ] && { usage; exit 1; }
-  case $1 in
-    -h|--help) usage; exit 0 ;;
-    prevent)   prevent; exit 0 ;;
-  esac
-
-  local target=$1; shift
-  local dry=0 yes=0 refresh=1 backup=1
-  for a in "$@"; do
-    case $a in
-      --dry-run) dry=1 ;;
-      -y|--yes) yes=1 ;;
-      --no-refresh) refresh=0 ;;
-      --no-backup) backup=0 ;;
-      *) usage; die "unknown option: $a" ;;
-    esac
-  done
-
-  command -v git-filter-repo >/dev/null || die "git-filter-repo not found (pipx install git-filter-repo)"
-
-  local slug="" url
-  if [[ $target =~ ^(https://github\.com/|git@github\.com:)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$ ]]; then
-    slug=${BASH_REMATCH[2]%.git}
-    command -v gh >/dev/null || die "gh (GitHub CLI) not found"
-    gh auth status -h github.com >/dev/null 2>&1 || die "gh is not logged in (run: gh auth login)"
-    if [ "$(gh config get -h github.com git_protocol 2>/dev/null)" = ssh ]; then
-      url="git@github.com:$slug.git"
-    else
-      url="https://github.com/$slug.git"
-      # authenticate https pushes with the gh login instead of prompting for a password
-      export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2 \
-        GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0= \
-        GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1='!gh auth git-credential'
-    fi
+# resolve TARGET into R_SLUG (empty for non-GitHub) and R_URL
+resolve() {
+  R_SLUG=""
+  if [[ $1 =~ ^(https://github\.com/|git@github\.com:)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$ ]]; then
+    R_SLUG=${BASH_REMATCH[2]%.git}
+    R_URL="$GH_PREFIX$R_SLUG.git"
   else
-    url=$target
-    refresh=0
+    R_URL=$1
   fi
+}
 
-  local repo
-  WORK=$(mktemp -d)
-  trap 'rm -rf "$WORK"' EXIT
-  repo="$WORK/repo.git"
-
-  say "cloning ${slug:-$url}…"
-  git clone -q --bare "$url" "$repo"
-
-  local traces authored
-  traces=$(count_traces "$repo")
-  authored=$(count_authored "$repo")
-  echo
-  say "repo     : ${slug:-$url}"
-  say "traces   : $traces commit(s) with a Claude co-author/generated line"
-  [ "$authored" -gt 0 ] && say "warning  : $authored commit(s) have Claude as author/committer; left as is (use git filter-repo --mailmap)"
-  if [ "$traces" -eq 0 ]; then
-    say "history already clean"
-    [ $refresh -eq 0 ] && exit 0
-    say "plan     : refresh GitHub's contributors graph only"
-  else
-    say "plan     : rewrite history, force-push branches + tags$([ $refresh -eq 1 ] && echo ', refresh graph')"
-  fi
-  echo
-
-  [ $dry -eq 1 ] && { say "dry run, nothing changed."; exit 0; }
-  if [ $yes -eq 0 ]; then
-    read -r -p "  Continue? type 'yes': " ok
-    [ "$ok" = yes ] || die "aborted"
-  fi
-
+# clean one scanned repo; runs in a subshell so a failure (die) stops only this repo
+apply_repo() {
+  local slug=$1 url=$2 repo=$3 traces=$4 refresh=$5 backup=$6
   if [ "$traces" -gt 0 ]; then
-    if [ $backup -eq 1 ]; then
+    if [ "$backup" -eq 1 ]; then
       mkdir -p "$BACKUP_DIR"
       local bundle="$BACKUP_DIR/$(basename "${slug:-$url}" .git)-$(date +%Y%m%d-%H%M%S).bundle"
       git -C "$repo" bundle create -q "$bundle" --all
@@ -161,9 +110,8 @@ main() {
     fi
 
     say "rewriting history…"
-    local out
+    local out left
     out=$(git -C "$repo" filter-repo --force --quiet --message-callback "$CALLBACK" 2>&1) || die "filter-repo failed: $out"
-    local left
     left=$(count_traces "$repo")
     [ "$left" -eq 0 ] || die "$left commit(s) still carry Claude lines; nothing pushed"
 
@@ -171,13 +119,139 @@ main() {
     git -C "$repo" remote add origin "$url"   # filter-repo drops origin
     git -C "$repo" push -q --force origin 'refs/heads/*:refs/heads/*'
     git -C "$repo" push -q --force origin 'refs/tags/*:refs/tags/*'
-  else
-    git -C "$repo" remote get-url origin >/dev/null 2>&1 || git -C "$repo" remote add origin "$url"
+  fi
+  [ "$refresh" -eq 1 ] && refresh_graph "$slug" "$repo"
+  return 0
+}
+
+main() {
+  [ $# -eq 0 ] && { usage; exit 1; }
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    prevent)   prevent; exit 0 ;;
+  esac
+
+  local dry=0 yes=0 refresh=1 backup=1 all=0 refresh_clean=-1
+  local targets=()
+  for a in "$@"; do
+    case $a in
+      --dry-run) dry=1 ;;
+      -y|--yes) yes=1 ;;
+      --no-refresh) refresh=0 ;;
+      --no-backup) backup=0 ;;
+      --refresh-clean) refresh_clean=1 ;;
+      --all) all=1 ;;
+      -*) usage; die "unknown option: $a" ;;
+      *) targets+=("$a") ;;
+    esac
+  done
+
+  command -v git-filter-repo >/dev/null || die "git-filter-repo not found (pipx install git-filter-repo)"
+
+  GH_PREFIX=""
+  local needs_gh=$all t
+  for t in "${targets[@]}"; do
+    [[ $t =~ ^(https://github\.com/|git@github\.com:)?[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && needs_gh=1
+  done
+  if [ "$needs_gh" -eq 1 ]; then
+    command -v gh >/dev/null || die "gh (GitHub CLI) not found"
+    gh auth status -h github.com >/dev/null 2>&1 || die "gh is not logged in (run: gh auth login)"
+    if [ "$(gh config get -h github.com git_protocol 2>/dev/null)" = ssh ]; then
+      GH_PREFIX="git@github.com:"
+    else
+      GH_PREFIX="https://github.com/"
+      # authenticate https pushes with the gh login instead of prompting for a password
+      export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2 \
+        GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0= \
+        GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1='!gh auth git-credential'
+    fi
   fi
 
-  [ $refresh -eq 1 ] && refresh_graph "$slug" "$repo"
-  echo
-  say "done."
+  if [ "$all" -eq 1 ]; then
+    local me
+    me=$(gh api user --jq .login)
+    mapfile -t -O "${#targets[@]}" targets < <(gh repo list "$me" --limit 1000 --source --no-archived --json nameWithOwner --jq '.[].nameWithOwner')
+  fi
+  [ ${#targets[@]} -eq 0 ] && die "no repositories given"
+  # a lone repo that's already clean still gets its graph flushed; in a batch it's skipped
+  [ "$refresh_clean" -eq -1 ] && refresh_clean=$([ ${#targets[@]} -eq 1 ] && echo 1 || echo 0)
+
+  WORK=$(mktemp -d)
+  trap 'rm -rf "$WORK"' EXIT
+
+  # scan every repo first so there is one plan and one confirmation
+  local names=() urls=() slugs=() dirs=() traces=() refreshes=() status=()
+  local i n=0 todo=0 tr au rf
+  for t in "${targets[@]}"; do
+    resolve "$t"
+    i=$n; n=$((n + 1))
+    names[i]=${R_SLUG:-$R_URL}; urls[i]=$R_URL; slugs[i]=$R_SLUG; dirs[i]="$WORK/$i.git"
+    printf '\n'
+    say "[$n/${#targets[@]}] ${names[i]}"
+    if ! git clone -q --bare "$R_URL" "${dirs[i]}" 2>"$WORK/err"; then
+      say "clone failed: $(tail -1 "$WORK/err")"
+      traces[i]=-1; refreshes[i]=0; status[i]="FAILED (clone)"
+      continue
+    fi
+    tr=$(count_traces "${dirs[i]}"); au=$(count_authored "${dirs[i]}")
+    traces[i]=$tr
+    rf=$refresh; [ -z "$R_SLUG" ] && rf=0
+    [ "$tr" -eq 0 ] && [ "$refresh_clean" -eq 0 ] && rf=0
+    refreshes[i]=$rf
+    say "traces   : $tr commit(s) with a Claude co-author/generated line"
+    [ "$au" -gt 0 ] && say "warning  : $au commit(s) have Claude as author/committer; left as is (use git filter-repo --mailmap)"
+    if [ "$tr" -gt 0 ]; then
+      say "plan     : rewrite history, force-push branches + tags$([ "$rf" -eq 1 ] && echo ', refresh graph')"
+      status[i]="to clean"; todo=$((todo + 1))
+    elif [ "$rf" -eq 1 ]; then
+      say "plan     : history clean; refresh GitHub's contributors graph only"
+      status[i]="to refresh"; todo=$((todo + 1))
+    else
+      say "plan     : history clean; nothing to do"
+      status[i]="clean"
+    fi
+  done
+
+  printf '\n'
+  if [ "$todo" -eq 0 ]; then
+    say "nothing to do."
+    [[ " ${status[*]} " == *FAILED* ]] && exit 1
+    exit 0
+  fi
+  if [ "$dry" -eq 1 ]; then
+    say "dry run: $todo repo(s) would be changed, nothing touched."
+    [[ " ${status[*]} " == *FAILED* ]] && exit 1
+    exit 0
+  fi
+  if [ "$yes" -eq 0 ]; then
+    read -r -p "  Change $todo repo(s)? type 'yes': " ok
+    [ "$ok" = yes ] || die "aborted"
+  fi
+
+  for ((i = 0; i < n; i++)); do
+    case ${status[i]} in "to clean"|"to refresh") ;; *) continue ;; esac
+    printf '\n'
+    say "── ${names[i]}"
+    set +e
+    ( set -e; apply_repo "${slugs[i]}" "${urls[i]}" "${dirs[i]}" "${traces[i]}" "${refreshes[i]}" "$backup" )
+    local rc=$?
+    set -e
+    if [ $rc -ne 0 ]; then
+      status[i]="FAILED"
+    elif [ "${status[i]}" = "to clean" ]; then
+      status[i]="cleaned"
+    else
+      status[i]="refreshed"
+    fi
+  done
+
+  printf '\n  summary\n'
+  local failed=0
+  for ((i = 0; i < n; i++)); do
+    printf '    %-12s %s\n' "${status[i]}" "${names[i]}"
+    [[ ${status[i]} == FAILED* ]] && failed=1
+  done
+  exit $failed
 }
 
 main "$@"
