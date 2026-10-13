@@ -61,21 +61,21 @@ unclaude prevent                  # stop Claude Code adding attribution in futur
 Example:
 
 ```
-$ unclaude Kumarsujay03/ubuntu-gdm-glass
-  cloning Kumarsujay03/ubuntu-gdm-glass…
+$ unclaude you/my-app
+  cloning you/my-app…
 
-  repo     : Kumarsujay03/ubuntu-gdm-glass
+  repo     : you/my-app
   traces   : 3 commit(s) with a Claude co-author/generated line
   plan     : rewrite history, force-push branches + tags, refresh graph
 
   Continue? type 'yes': yes
-  backup   : /home/you/.unclaude-backups/ubuntu-gdm-glass-20261013-124126.bundle
+  backup   : /home/you/.unclaude-backups/my-app-20261013-124126.bundle
   rewriting history…
   force-pushing branches and tags…
   flushing contributor cache (rename main → main-unclaude-tmp → main)…
   pushing empty refresh commit to main…
   waiting for GitHub to rebuild the graph…
-  contributors now: Kumarsujay03
+  contributors now: you
 
   done.
 ```
