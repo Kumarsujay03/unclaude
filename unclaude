@@ -107,10 +107,15 @@ main() {
   if [[ $target =~ ^(https://github\.com/|git@github\.com:)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$ ]]; then
     slug=${BASH_REMATCH[2]%.git}
     command -v gh >/dev/null || die "gh (GitHub CLI) not found"
-    if [ "$(gh config get git_protocol 2>/dev/null)" = ssh ]; then
+    gh auth status -h github.com >/dev/null 2>&1 || die "gh is not logged in (run: gh auth login)"
+    if [ "$(gh config get -h github.com git_protocol 2>/dev/null)" = ssh ]; then
       url="git@github.com:$slug.git"
     else
       url="https://github.com/$slug.git"
+      # authenticate https pushes with the gh login instead of prompting for a password
+      export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2 \
+        GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0= \
+        GIT_CONFIG_KEY_1=credential.https://github.com.helper GIT_CONFIG_VALUE_1='!gh auth git-credential'
     fi
   else
     url=$target
