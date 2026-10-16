@@ -1,5 +1,7 @@
 # unclaude
 
+<p align="center"><img src="docs/banner.png" alt="unclaude banner" width="100%"></p>
+
 Remove Claude / AI attribution from a GitHub repo's commit history and make `@claude` disappear from the **Contributors** graph — in one command. A single Bash script, no Python package to install.
 
 ## Why @claude shows up
